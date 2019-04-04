@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This template creates a state machine that exports all CloudWatch Logs log groups to S3."
+Parameters:
+  DestinationS3BucketName:
+    Description: "CloudWatchLogs Export Task Destination S3 Bucket Name."
+    Type: String
+
+  CreateNewS3Bucket: 
+    Description: "Create New S3 Bucket? if Use Exist S3 Bucket, Setting Bucket Policy. -> https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/S3ExportTasksConsole.html#S3PermissionsConsole"
+    Default: Yes
+    Type: String
+    AllowedValues: 
+      - Yes
+      - No
+
+Conditions: 
+  CreateNewS3Bucket: !Equals [!Ref CreateNewS3Bucket, Yes]
+
+Resources:
+  DestinationS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateNewS3Bucket
+    Properties: 
+      BucketName: !Ref DestinationS3BucketName
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  DestinationS3BucketPolicy: 
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateNewS3Bucket
+    Properties: 
+      Bucket: 
+        !Ref DestinationS3Bucket
+      PolicyDocument: 
+        Statement: 
+          - Action: 
+              - "s3:GetBucketAcl"
+            Effect: "Allow"
+            Resource: 
+              Fn::Join: 
+                - ""
+                - 
+                  - "arn:aws:s3:::"
+                  - !Ref DestinationS3Bucket
+            Principal: 
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+          - Action: 
+              - "s3:PutObject"
+            Effect: "Allow"
+            Resource: 
+              Fn::Join: 
+                - ""
+                - 
+                  - "arn:aws:s3:::"
+                  - !Ref DestinationS3Bucket
+                  - "/*"
+            Principal: 
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Condition: 
+              StringEquals: 
+                s3:x-amz-acl: "bucket-owner-full-control"
+
+  CWLogsExportLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies: 
+        - PolicyName: "CWLogsExportLambdaExecutionPolicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:createExportTask"
+                  - "logs:describeLogGroups"
+                  - "logs:describeExportTasks"
+                Resource: "*"
+
+  CWLogsExportGetLogGroup:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub "GetLogGroup-${AWS::Region}"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt [ CWLogsExportLambdaExecutionRole, Arn ]
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              # logger.error('something went wrong')
+              logger.debug("Function Name : " + context.function_name)
+              logger.debug("Function Version : " + context.function_version)
+              logger.debug("Request ID : " + context.aws_request_id)
+              logger.debug("Mem. limits(MB) : " + context.memory_limit_in_mb)
+              logger.debug('got event : {}'.format(event))
+              
+              logs_client = boto3.client('logs')
+              
+              if 'GetLogGroup' in event.keys():
+                  if 'nextToken' in event['GetLogGroup'].keys():
+                      try:
+                          logs_response = logs_client.describe_log_groups(
+                              nextToken=event['GetLogGroup']['nextToken'],
+                              limit=1
+                          )
+                      except:
+                          raise
+                      logger.info("Find Next LogGroup.")  
+                      logger.info("logGroupName : " + logs_response['logGroups'][0]['logGroupName'])
+                  else:
+                      logger.info("All GetLogGroup been completed.")
+                      return {'logGroups': 'fin'}
+              else:
+                  logger.info("First GetLogGroup Action.")
+                  try:
+                      logs_response = logs_client.describe_log_groups(
+                          limit=1
+                      )
+                  except:
+                      raise
+                  if 'logGroupName' in logs_response['logGroups'][0].keys():
+                      logger.info("Find First LogGroup.")
+                      logger.info("logGroupName : " + logs_response['logGroups'][0]['logGroupName'])
+                  else:
+                      logger.info("LogGroup NOT Found.")
+                      return {'logGroups': 'fin'}
+              return logs_response
+
+      Runtime: "python3.6"
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TZ: Asia/Tokyo
+
+  CWLogsExportCreateExportTask:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub "CreateExportTask-${AWS::Region}"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt [ CWLogsExportLambdaExecutionRole, Arn ]
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import datetime
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_daycount(event):
+              if "TargetDate" in event:
+                  logger.info("TargetDate Found.")
+                  TargetDate = datetime.datetime.strptime(event['TargetDate'], '%Y-%m-%d').date()
+                  logger.info("TargetDate : " + str(TargetDate))
+                  daycount=(datetime.datetime.today().date()-TargetDate).days
+                  logger.info("Will Export The Logs " + str(daycount) + " Days ago.")
+              else:
+                  logger.info("TargetDate NOT Found.")
+                  logger.info("Will Export The Logs Of Yesterday.")
+                  daycount=1
+              
+              return daycount
+
+          def get_from_timestamp(daycount):
+              today = datetime.datetime.today()
+              yesterday = datetime.datetime.combine(today - datetime.timedelta(days = daycount), datetime.time(0, 0, 0))
+              timestamp = time.mktime(yesterday.timetuple())
+              return int(timestamp)
+              
+          def get_to_timestamp(fromTime):
+              return fromTime + (60 * 60 * 24)
+
+          def lambda_handler(event, context):
+              # logger.error('something went wrong')
+              logger.debug("Function Name : " + context.function_name)
+              logger.debug("Function Version : " + context.function_version)
+              logger.debug("Request ID : " + context.aws_request_id)
+              logger.debug("Mem. limits(MB) : " + context.memory_limit_in_mb)
+              logger.debug('got event : {}'.format(event))
+
+              daycount = get_daycount(event)
+
+              logGroupName = event['GetLogGroup']['logGroups'][0]['logGroupName']
+              fromTime = get_from_timestamp(daycount)
+              to = get_to_timestamp(fromTime)
+              destination = os.environ['BucketName']
+              if logGroupName.startswith("/"):
+                  destinationPrefix = "CWLogs/" + os.environ['AWS_REGION'] + "/" + (datetime.datetime.today() - datetime.timedelta(days = daycount)).strftime('%Y/%m/%d') + logGroupName
+              else:
+                  destinationPrefix = "CWLogs/" + os.environ['AWS_REGION'] + "/" + (datetime.datetime.today() - datetime.timedelta(days = daycount)).strftime('%Y/%m/%d') + "/" + logGroupName
+              
+              logger.info("logGroupName : " + logGroupName)
+              logger.info("fromTime : " + str(fromTime * 1000))
+              logger.info("to : " + str(to * 1000))
+              logger.info("destination : " + destination)
+              logger.info("destinationPrefix : " + destinationPrefix)
+              
+              logs_client = boto3.client('logs')
+              try:
+                  logs_response = logs_client.create_export_task(
+                      logGroupName=logGroupName,
+                      fromTime=fromTime * 1000,
+                      to=to * 1000,
+                      destination=destination,
+                      destinationPrefix=destinationPrefix
+                  )
+              except:
+                  raise
+              return logs_response
+
+      Runtime: "python3.6"
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TZ: Asia/Tokyo
+          BucketName: !Ref DestinationS3BucketName
+
+  CWLogsExportGetExportTaskState:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub "GetExportTaskState-${AWS::Region}"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt [ CWLogsExportLambdaExecutionRole, Arn ]
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              # logger.error('something went wrong')
+              logger.debug("Function Name : " + context.function_name)
+              logger.debug("Function Version : " + context.function_version)
+              logger.debug("Request ID : " + context.aws_request_id)
+              logger.debug("Mem. limits(MB) : " + context.memory_limit_in_mb)
+              logger.debug('got event : {}'.format(event))
+
+              taskId = event['CreateExportTask']['taskId']
+
+              logger.info("taskId : " + taskId)
+
+              logs_client = boto3.client('logs')
+              try:
+                  logs_response = logs_client.describe_export_tasks(
+                      taskId=taskId,
+                  )
+              except:
+                  raise
+              
+              status_code = logs_response['exportTasks'][0]['status']['code']
+              logger.info("Task state is " + status_code )
+              
+              return logs_response
+                  
+      Runtime: "python3.6"
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TZ: Asia/Tokyo
+
+  CWLogsExportStatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  CWLogsExport:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Sub "CloudWatchLogs-ExportJob-${AWS::Region}"
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "StartAt": "GetLogGroup",
+              "TimeoutSeconds": 3600,
+              "States": {
+                "GetLogGroup": {
+                  "Type": "Task",
+                  "Resource": "${GetLogGroup}",
+                  "Next": "CheckLogGroup",
+                  "ResultPath": "$.GetLogGroup",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [ "Lambda.ServiceException", "Lambda.SdkClientException" ],
+                      "IntervalSeconds": 5,
+                      "BackoffRate": 2,
+                      "MaxAttempts": 6
+                    }
+                  ],
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"], 
+                      "Next": "ErrorEnd", 
+                      "ResultPath": "$.GetLogGroup.Error" 
+                    }
+                  ]
+                },
+                "CheckLogGroup": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.GetLogGroup.logGroups",
+                      "StringEquals": "fin",
+                      "Next": "NormalEnd"
+                    }
+                  ],
+                  "Default": "CreateExportTask"
+                },
+                "CreateExportTask": {
+                  "Type": "Task",
+                  "Resource": "${CreateExportTask}",
+                  "Next": "WaitExportTask",
+                  "ResultPath": "$.CreateExportTask",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [ "Lambda.ServiceException", "Lambda.SdkClientException" ],
+                      "IntervalSeconds": 5,
+                      "BackoffRate": 2,
+                      "MaxAttempts": 6
+                    }
+                  ],
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"], 
+                      "Next": "ErrorEnd", 
+                      "ResultPath": "$.CreateExportTask.Error" 
+                    }
+                  ]
+                },
+                "WaitExportTask": {
+                  "Type": "Wait",
+                  "Seconds": 30,
+                  "Next": "GetExportTaskState"
+                },
+                "GetExportTaskState": {
+                  "Type": "Task",
+                  "Resource": "${GetExportTaskState}",
+                  "Next": "CheckExportTaskState",
+                  "ResultPath": "$.GetExportTaskState",
+                  "Retry": [
+                    {
+                      "ErrorEquals": [ "Lambda.ServiceException", "Lambda.SdkClientException" ],
+                      "IntervalSeconds": 5,
+                      "BackoffRate": 2,
+                      "MaxAttempts": 6
+                    }
+                  ],
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"], 
+                      "Next": "ErrorEnd", 
+                      "ResultPath": "$.GetExportTaskState.Error" 
+                    }
+                  ]
+                },
+                "CheckExportTaskState": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.GetExportTaskState.exportTasks[0].status.code",
+                      "StringEquals": "COMPLETED",
+                      "Next": "GetLogGroup"
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.GetExportTaskState.exportTasks[0].status.code",
+                          "StringEquals": "FAILED"
+                        },
+                        {
+                          "Variable": "$.GetExportTaskState.exportTasks[0].status.code",
+                          "StringEquals": "CANCELLED"
+                        },
+                        {
+                          "Variable": "$.GetExportTaskState.exportTasks[0].status.code",
+                          "StringEquals": "PENDING_CANCEL"
+                        }
+                      ],
+                      "Next": "AbnormalEnd"
+                    }
+                  ],
+                  "Default": "WaitExportTask"
+                },
+                "NormalEnd": {
+                  "Type": "Succeed"
+                },
+                "ErrorEnd": {
+                  "Type": "Fail",
+                  "Error": "$.error"
+                },
+                "AbnormalEnd": {
+                  "Type": "Fail",
+                  "Cause": "ExportTask Abnormal End."
+                }
+              }
+            }
+          - {GetLogGroup: !GetAtt [ CWLogsExportGetLogGroup, Arn ], CreateExportTask: !GetAtt [ CWLogsExportCreateExportTask, Arn ], GetExportTaskState: !GetAtt [ CWLogsExportGetExportTaskState, Arn ]}
+
+      RoleArn: !GetAtt [ CWLogsExportStatesExecutionRole, Arn ]
