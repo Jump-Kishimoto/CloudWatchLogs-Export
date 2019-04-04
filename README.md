@@ -16,14 +16,14 @@ The export time range is from 9:00 (UTC) yesterday to 9:00 (UTC) today.
 
 ### 2. Create and Enter Parameter to CloudFormation Stack
 If Create New S3 Bucket:
-* CreateNewS3Bucket：true
-* DestinationS3BucketName：<font color="Red">NewBucketName</font>
+* CreateNewS3Bucket：**true**
+* DestinationS3BucketName：___NewBucketName___
 
 If Use Existing S3 Bucket:
-* CreateNewS3Bucket：false
-* DestinationS3BucketName：<font color="Red">ExistingBucketName</font>
+* CreateNewS3Bucket：**false**
+* DestinationS3BucketName：___ExistingBucketName___
 
-!! The Bucket Policy settings are required for the existing S3 Bucket. Please see belew
+**!! The Bucket Policy settings are required for the existing S3 Bucket. Please see belew**
 https://docs.aws.amazon.com/ja_jp/AmazonCloudWatch/latest/logs/S3ExportTasksConsole.html#S3PermissionsConsole
 
 ### 3. Execute State Machine
