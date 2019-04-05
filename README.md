@@ -7,7 +7,7 @@ State Machine export all CloudWatch Logs Log Groups to S3.
 
 All Log Groups in the same region as State Machine are exported.
 
-The export time range is from 9:00 (UTC) yesterday to 9:00 (UTC) today.
+The export time range is from 0:00 (JST) yesterday to 0:00 (JST) today.
 
 ## Usage
 
